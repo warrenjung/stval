@@ -10,17 +10,21 @@ Example:
   python dcf.py MSFT --market-return 0.10 --terminal-growth 0.03
   python dcf.py VRSN --analyst-source none
   python dcf.py HSY --beta-method blume
+  python dcf.py HSY --growth-method weighted-median
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import warnings as py_warnings
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import numpy as np
 
@@ -36,11 +40,14 @@ DEFAULT_MARKET_RETURN = 0.10
 DEFAULT_TERMINAL_GROWTH = 0.03
 DEFAULT_DECAY_FACTOR = 0.5
 DEFAULT_CLAMP_K = 1.0
-DEFAULT_ANALYST_WEIGHT = 0.10
-DEFAULT_ANALYST_SOURCE = "revenue"
-DEFAULT_BETA_METHOD = "raw"
+DEFAULT_ANALYST_SOURCE = "auto"
+DEFAULT_YAHOO_TO_FMP_THRESHOLD = 0.20
+DEFAULT_ANALYST_CAP_MULTIPLE = 1.5
+DEFAULT_BETA_METHOD = "blume"
+DEFAULT_GROWTH_METHOD = "weighted-average"
 DEFAULT_TAX_RATE = 0.21
 DEFAULT_ADJUSTMENT = 0.0
+FMP_API_KEY = "nb5IH5DmmnfkTdZmUiix4ZHmq1To2DbQ"
 
 
 OCF_ROWS = (
@@ -62,6 +69,7 @@ TAX_ROWS = ("Tax Provision", "Income Tax Expense")
 PRETAX_ROWS = ("Pretax Income", "Income Before Tax", "Earnings Before Tax")
 DEBT_ROWS = ("Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation")
 SHARES_ROWS = ("Ordinary Shares Number", "Share Issued", "Common Stock Shares Outstanding")
+REVENUE_ROWS = ("Total Revenue", "Operating Revenue")
 
 
 @dataclass
@@ -244,32 +252,176 @@ def regression_growth(fcf_values: list[float], warnings: list[str]) -> tuple[flo
     return math.exp(float(slope)) - 1.0, r2
 
 
-def time_weighted_growth(
-    raw_growth_rates: list[float],
-    decay_factor: float,
-    clamp_k: float,
-    warnings: list[str],
-) -> tuple[float, list[float]]:
-    # STEP 2b - Clamp outliers and weight recent growth more heavily.
-    rates = [rate for rate in raw_growth_rates if rate is not None and math.isfinite(rate)]
-    if not rates:
-        warn(warnings, "Time-weighted average growth unavailable: no usable growth observations.")
-        return 0.0, []
-
+def outlier_adjusted_bounds(rates: list[float], clamp_k: float, warnings: list[str]) -> tuple[float, float]:
     mean = float(np.mean(rates))
     sample_std = float(np.std(rates, ddof=1)) if len(rates) > 1 else 0.0
     lower = mean - clamp_k * sample_std
     upper = mean + clamp_k * sample_std
+    inliers = [rate for rate in rates if lower <= rate <= upper]
+
+    if len(inliers) < 2 or len(inliers) == len(rates):
+        return lower, upper
+
+    adjusted_mean = float(np.mean(inliers))
+    adjusted_std = float(np.std(inliers, ddof=1))
+    adjusted_lower = adjusted_mean - clamp_k * adjusted_std
+    adjusted_upper = adjusted_mean + clamp_k * adjusted_std
+    warn(
+        warnings,
+        f"Growth clamp stdev recalculated after excluding {len(rates) - len(inliers)} outlier(s).",
+    )
+    return adjusted_lower, adjusted_upper
+
+
+def recency_weights(count: int, decay_factor: float) -> list[float]:
+    newest_first = [decay_factor**years_ago for years_ago in range(count)]
+    return list(reversed(newest_first))
+
+
+def weighted_median(values: list[float], weights: list[float]) -> float:
+    ordered = sorted(zip(values, weights), key=lambda item: item[0])
+    total_weight = sum(weights)
+    threshold = total_weight / 2.0
+    cumulative = 0.0
+    for value, weight in ordered:
+        cumulative += weight
+        if cumulative >= threshold:
+            return value
+    return ordered[-1][0]
+
+
+def historical_growth_estimate(
+    raw_growth_rates: list[float],
+    decay_factor: float,
+    clamp_k: float,
+    growth_method: str,
+    warnings: list[str],
+) -> tuple[float, list[float]]:
+    # STEP 2b - Clamp outliers, then estimate historical growth with the selected method.
+    rates = [rate for rate in raw_growth_rates if rate is not None and math.isfinite(rate)]
+    if not rates:
+        warn(warnings, "Historical growth estimate unavailable: no usable growth observations.")
+        return 0.0, []
+
+    lower, upper = outlier_adjusted_bounds(rates, clamp_k, warnings)
     cleaned = [float(np.median([rate, lower, upper])) for rate in rates]
 
-    newest_first = list(reversed(cleaned))
-    weights = [decay_factor**years_ago for years_ago in range(len(newest_first))]
-    weighted_avg = sum(weight * rate for weight, rate in zip(weights, newest_first)) / sum(weights)
+    if growth_method == "median":
+        return float(np.median(cleaned)), cleaned
+
+    weights = recency_weights(len(cleaned), decay_factor)
+    if growth_method == "weighted-median":
+        return weighted_median(cleaned, weights), cleaned
+
+    weighted_avg = sum(weight * rate for weight, rate in zip(weights, cleaned)) / sum(weights)
     return weighted_avg, cleaned
 
 
-def analyst_growth_rate(
+def latest_annual_statement_date(historical: list[HistoricalFCF]) -> datetime | None:
+    for item in reversed(historical):
+        if item.label == "TTM":
+            continue
+        try:
+            return datetime.strptime(item.label, "%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def ttm_revenue(ticker: yf.Ticker, info: dict, warnings: list[str]) -> float | None:
+    quarterly_income = ticker.quarterly_income_stmt
+    quarterly_columns = available_statement_columns(quarterly_income)
+    recent_quarters = quarterly_columns[-4:]
+    if len(recent_quarters) == 4:
+        values = []
+        for column in recent_quarters:
+            value = first_statement_value(quarterly_income, REVENUE_ROWS, column)
+            if value is not None:
+                values.append(value)
+        if len(values) == 4:
+            return sum(values)
+
+    value = first_info_number(info, ("totalRevenue",))
+    if value is not None and value > 0:
+        warn(warnings, "TTM revenue unavailable from quarterly income statement; using Yahoo .info totalRevenue.")
+        return value
+
+    warn(warnings, "TTM revenue unavailable; FMP analyst revenue CAGR cannot be computed.")
+    return None
+
+
+def fetch_fmp_analyst_estimates(ticker_symbol: str, warnings: list[str]) -> list[dict]:
+    if not FMP_API_KEY:
+        warn(warnings, "FMP API key is missing; FMP analyst growth unavailable.")
+        return []
+
+    params = urlencode(
+        {
+            "symbol": ticker_symbol,
+            "period": "annual",
+            "page": 0,
+            "limit": 10,
+            "apikey": FMP_API_KEY,
+        }
+    )
+    url = f"https://financialmodelingprep.com/stable/analyst-estimates?{params}"
+    try:
+        with urlopen(url, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        warn(warnings, f"FMP analyst estimates unavailable ({exc}).")
+        return []
+
+    if not isinstance(data, list):
+        warn(warnings, "FMP analyst estimates response was not a list.")
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def fmp_revenue_cagr(
+    ticker_symbol: str,
+    ticker: yf.Ticker,
     info: dict,
+    historical: list[HistoricalFCF],
+    warnings: list[str],
+) -> tuple[float | None, str]:
+    base_revenue = ttm_revenue(ticker, info, warnings)
+    base_date = latest_annual_statement_date(historical)
+    if base_revenue is None or base_revenue <= 0 or base_date is None:
+        warn(warnings, "FMP analyst revenue CAGR unavailable because base revenue/date is missing.")
+        return None, "FMP unavailable"
+
+    candidates = []
+    for item in fetch_fmp_analyst_estimates(ticker_symbol, warnings):
+        estimate_revenue = finite_number(item.get("revenueAvg"))
+        estimate_date_raw = item.get("date")
+        analysts = finite_number(item.get("numAnalystsRevenue"))
+        if estimate_revenue is None or estimate_revenue <= 0 or analysts in (None, 0):
+            continue
+        try:
+            estimate_date = datetime.strptime(str(estimate_date_raw), "%Y-%m-%d")
+        except ValueError:
+            continue
+        years = (estimate_date - base_date).days / 365.25
+        if years <= 0:
+            continue
+        cagr = (estimate_revenue / base_revenue) ** (1.0 / years) - 1.0
+        candidates.append((abs(years - 5.0), years, cagr, estimate_date_raw, int(analysts)))
+
+    if not candidates:
+        warn(warnings, "FMP analyst revenue CAGR unavailable: no usable future revenue estimates.")
+        return None, "FMP unavailable"
+
+    _, years, cagr, estimate_date, analysts = sorted(candidates, key=lambda item: item[0])[0]
+    source = f"FMP revenue CAGR to {estimate_date} ({years:.1f} yrs, {analysts} analysts)"
+    return cagr, source
+
+
+def analyst_growth_rate(
+    ticker_symbol: str,
+    ticker: yf.Ticker,
+    info: dict,
+    historical: list[HistoricalFCF],
     override: float | None,
     source: str,
     warnings: list[str],
@@ -281,6 +433,27 @@ def analyst_growth_rate(
     if source == "none":
         warn(warnings, "Analyst growth source set to none; analyst blend weight set to 0.")
         return None, "disabled"
+
+    if source == "fmp":
+        return fmp_revenue_cagr(ticker_symbol, ticker, info, historical, warnings)
+
+    if source == "auto":
+        yahoo_rate = first_info_number(info, ("revenueGrowth",))
+        if yahoo_rate is None:
+            warn(warnings, "Yahoo revenueGrowth unavailable in auto mode; trying FMP.")
+            return fmp_revenue_cagr(ticker_symbol, ticker, info, historical, warnings)
+        if yahoo_rate <= DEFAULT_YAHOO_TO_FMP_THRESHOLD:
+            return yahoo_rate, "Yahoo info['revenueGrowth'] auto"
+
+        fmp_rate, fmp_source = fmp_revenue_cagr(ticker_symbol, ticker, info, historical, warnings)
+        if fmp_rate is not None:
+            return fmp_rate, f"{fmp_source}; auto-switched because Yahoo revenueGrowth was {format_percent(yahoo_rate)}"
+
+        warn(
+            warnings,
+            f"FMP unavailable in auto mode; falling back to Yahoo revenueGrowth {format_percent(yahoo_rate)}.",
+        )
+        return yahoo_rate, "Yahoo info['revenueGrowth'] auto fallback"
 
     if source == "revenue":
         keys = ("revenueGrowth",)
@@ -296,27 +469,49 @@ def analyst_growth_rate(
     return None, "unavailable"
 
 
+def final_growth_rate(
+    core_growth: float,
+    analyst_rate: float | None,
+    analyst_source: str,
+    cap_multiple: float,
+    warnings: list[str],
+) -> tuple[float, float | None, str]:
+    if analyst_rate is None:
+        warn(warnings, "No analyst rate available; using uncapped core growth.")
+        return core_growth, None, "none"
+
+    cap = analyst_rate * cap_multiple
+    if core_growth > cap:
+        warn(
+            warnings,
+            f"Core growth capped from {format_percent(core_growth)} to {format_percent(cap)} "
+            f"using {cap_multiple:g}x analyst rate.",
+        )
+        return cap, cap, f"{cap_multiple:g}x {analyst_source}"
+
+    return core_growth, cap, f"{cap_multiple:g}x {analyst_source}"
+
+
 def project_fcf(
     starting_fcf: float,
-    blended_growth: float,
+    final_growth: float,
     terminal_growth: float,
     wacc: float,
 ) -> list[Projection]:
     # STEP 3 and STEP 5 - Ten-year FCF projection and present value.
     projections: list[Projection] = []
     previous_fcf = starting_fcf
-    previous_growth = blended_growth
+    fade_step = (terminal_growth - final_growth) / 6.0
 
     for year in range(1, 11):
         if year <= 5:
-            growth = blended_growth
+            growth = final_growth
         else:
-            growth = previous_growth + (terminal_growth - previous_growth) / 5.0
+            growth = final_growth + fade_step * (year - 5)
         fcf = previous_fcf * (1.0 + growth)
         pv = fcf / ((1.0 + wacc) ** year)
         projections.append(Projection(year=year, growth=growth, fcf=fcf, pv=pv))
         previous_fcf = fcf
-        previous_growth = growth
 
     return projections
 
@@ -381,6 +576,33 @@ def market_cap(info: dict, warnings: list[str]) -> float | None:
         warn(warnings, "Market cap unavailable; WACC cannot be computed.")
         return None
     return value
+
+
+def current_stock_price(ticker: yf.Ticker, info: dict, warnings: list[str]) -> float | None:
+    value = first_info_number(info, ("currentPrice", "regularMarketPrice", "previousClose"))
+    if value is not None and value > 0:
+        return value
+
+    try:
+        fast_info = ticker.fast_info
+        for key in ("last_price", "regular_market_previous_close"):
+            value = finite_number(fast_info.get(key))
+            if value is not None and value > 0:
+                return value
+    except Exception as exc:
+        warn(warnings, f"Could not load fast price data ({exc}).")
+
+    try:
+        history = ticker.history(period="5d")
+        if not history.empty and "Close" in history:
+            value = finite_number(history["Close"].dropna().iloc[-1])
+            if value is not None and value > 0:
+                return value
+    except Exception as exc:
+        warn(warnings, f"Could not load recent price history ({exc}).")
+
+    warn(warnings, "Current stock price unavailable.")
+    return None
 
 
 def beta(info: dict, warnings: list[str]) -> float:
@@ -492,11 +714,14 @@ def print_outputs(
     cleaned_growth: list[float],
     reg_growth: float,
     r2: float,
-    time_weighted_avg: float,
+    growth_method: str,
+    historical_growth: float,
     analyst_rate: float | None,
     analyst_source: str,
-    analyst_weight: float,
-    blended_growth: float,
+    core_growth: float,
+    analyst_growth_cap: float | None,
+    analyst_growth_cap_source: str,
+    final_growth: float,
     projections: list[Projection],
     market_cap_value: float,
     debt: float,
@@ -514,6 +739,7 @@ def print_outputs(
     pv_terminal: float,
     enterprise_value: float,
     shares: float,
+    current_price: float | None,
     intrinsic_price: float,
     warnings: list[str],
 ) -> None:
@@ -542,10 +768,17 @@ def print_outputs(
     growth_rows = [
         ["Regression Growth", format_percent(reg_growth)],
         ["Regression R^2", format_number(r2)],
-        ["Time-Weighted Average", format_percent(time_weighted_avg)],
+        ["Historical Growth Method", growth_method],
+        ["Historical Growth Estimate", format_percent(historical_growth)],
         ["Analyst Rate", f"{format_percent(analyst_rate)} ({analyst_source})"],
-        ["Analyst Weight", format_percent(analyst_weight)],
-        ["Blended Growth", format_percent(blended_growth)],
+        ["Core Growth", format_percent(core_growth)],
+        [
+            "Analyst Growth Cap",
+            f"{format_percent(analyst_growth_cap)} ({analyst_growth_cap_source})"
+            if analyst_growth_cap is not None
+            else "n/a",
+        ],
+        ["Final Growth", format_percent(final_growth)],
     ]
     if cleaned_growth:
         growth_rows.append(["Cleaned Growth Rates", ", ".join(format_percent(rate) for rate in cleaned_growth)])
@@ -579,6 +812,7 @@ def print_outputs(
         ["Enterprise Value (Total)", format_money(enterprise_value)],
         ["Total Debt", format_money(debt)],
         ["Shares Outstanding", format_money(shares)],
+        ["Current Stock Price", f"${current_price:,.2f}" if current_price is not None else "n/a"],
         ["Intrinsic Price (Price)", f"${intrinsic_price:,.2f}"],
     ]
     print_table("Step 5 - Valuation", ["Metric", "Value"], valuation_rows)
@@ -602,15 +836,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--analyst-source",
-        choices=("revenue", "earnings", "none"),
+        choices=("auto", "revenue", "earnings", "fmp", "none"),
         default=DEFAULT_ANALYST_SOURCE,
-        help="Yahoo growth proxy to blend when --analyst-rate is not supplied.",
+        help="Growth proxy to blend when --analyst-rate is not supplied. Auto uses Yahoo unless revenueGrowth > 20%%, then tries FMP.",
     )
     parser.add_argument("--terminal-growth", type=float, default=DEFAULT_TERMINAL_GROWTH, help="Terminal growth rate.")
     parser.add_argument("--adjustment", type=float, default=DEFAULT_ADJUSTMENT, help="Manual annual/TTM FCF adjustment.")
     parser.add_argument("--decay-factor", type=float, default=DEFAULT_DECAY_FACTOR, help="Time-weight decay factor.")
     parser.add_argument("--clamp-k", type=float, default=DEFAULT_CLAMP_K, help="Growth clamp sample-stdev multiplier.")
-    parser.add_argument("--analyst-weight", type=float, default=DEFAULT_ANALYST_WEIGHT, help="Analyst blend weight.")
+    parser.add_argument(
+        "--growth-method",
+        choices=("weighted-average", "median", "weighted-median"),
+        default=DEFAULT_GROWTH_METHOD,
+        help="Method used to summarize cleaned historical growth rates.",
+    )
     parser.add_argument(
         "--beta-method",
         choices=("raw", "blume"),
@@ -631,8 +870,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--decay-factor must be between 0 and 1.")
     if args.clamp_k < 0:
         raise ValueError("--clamp-k must be non-negative.")
-    if not 0.0 <= args.analyst_weight <= 1.0:
-        raise ValueError("--analyst-weight must be between 0 and 1.")
 
 
 def main() -> int:
@@ -663,12 +900,31 @@ def main() -> int:
     fcf_values = [item.fcf for item in historical]
     raw_growth = [item.growth for item in historical[1:] if item.growth is not None]
     reg_growth, r2 = regression_growth(fcf_values, warnings)
-    time_weighted_avg, cleaned_growth = time_weighted_growth(raw_growth, args.decay_factor, args.clamp_k, warnings)
+    historical_growth, cleaned_growth = historical_growth_estimate(
+        raw_growth,
+        args.decay_factor,
+        args.clamp_k,
+        args.growth_method,
+        warnings,
+    )
 
-    analyst_rate, analyst_source = analyst_growth_rate(info, args.analyst_rate, args.analyst_source, warnings)
-    effective_analyst_weight = args.analyst_weight if analyst_rate is not None else 0.0
-    core_growth = r2 * reg_growth + (1.0 - r2) * time_weighted_avg
-    blended_growth = effective_analyst_weight * (analyst_rate or 0.0) + (1.0 - effective_analyst_weight) * core_growth
+    analyst_rate, analyst_source = analyst_growth_rate(
+        ticker_symbol,
+        ticker,
+        info,
+        historical,
+        args.analyst_rate,
+        args.analyst_source,
+        warnings,
+    )
+    core_growth = r2 * reg_growth + (1.0 - r2) * historical_growth
+    final_growth, analyst_growth_cap, analyst_growth_cap_source = final_growth_rate(
+        core_growth,
+        analyst_rate,
+        analyst_source,
+        DEFAULT_ANALYST_CAP_MULTIPLE,
+        warnings,
+    )
 
     market_cap_value = market_cap(info, warnings)
     shares = shares_outstanding(ticker, info, warnings)
@@ -684,6 +940,7 @@ def main() -> int:
     tax_rate = effective_tax_rate(ticker, warnings)
     interest = interest_expense(ticker, warnings)
     risk_free = risk_free_rate(warnings)
+    current_price = current_stock_price(ticker, info, warnings)
 
     try:
         cost_of_equity, after_tax_cost_of_debt, wacc = compute_wacc(
@@ -696,7 +953,7 @@ def main() -> int:
             tax_rate=tax_rate,
             warnings=warnings,
         )
-        projections = project_fcf(historical[-1].fcf, blended_growth, args.terminal_growth, wacc)
+        projections = project_fcf(historical[-1].fcf, final_growth, args.terminal_growth, wacc)
         pv_explicit = sum(item.pv for item in projections)
         tv = terminal_value(projections[-1].fcf, args.terminal_growth, wacc)
         pv_terminal = tv / ((1.0 + wacc) ** 10)
@@ -714,11 +971,14 @@ def main() -> int:
         cleaned_growth=cleaned_growth,
         reg_growth=reg_growth,
         r2=r2,
-        time_weighted_avg=time_weighted_avg,
+        growth_method=args.growth_method,
+        historical_growth=historical_growth,
         analyst_rate=analyst_rate,
         analyst_source=analyst_source,
-        analyst_weight=effective_analyst_weight,
-        blended_growth=blended_growth,
+        core_growth=core_growth,
+        analyst_growth_cap=analyst_growth_cap,
+        analyst_growth_cap_source=analyst_growth_cap_source,
+        final_growth=final_growth,
         projections=projections,
         market_cap_value=market_cap_value,
         debt=debt,
@@ -736,6 +996,7 @@ def main() -> int:
         pv_terminal=pv_terminal,
         enterprise_value=enterprise_value,
         shares=shares,
+        current_price=current_price,
         intrinsic_price=intrinsic_price,
         warnings=warnings,
     )
